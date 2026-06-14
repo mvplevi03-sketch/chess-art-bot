@@ -15,35 +15,41 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 competition = {
     "active": False,
-    "entries": [],
-    "current_index": -1,
-    "scores": {},
-    "owner_names": {},
+    "entries": [],          # [{"owner_id", "owner_name", "image_url"}]
+    "scores": {},            # {owner_id: total_stars}
+    "owner_names": {},        # {owner_id: owner_name}
     "channel_id": None,
-    "voting_message": None,
+    "vote_views": [],         # كل الـ views النشطة
 }
 
-VOTE_DURATION = 30
+EVENT_DURATION = 48 * 60 * 60  # 48 ساعة بالثواني
 
 
 class VoteView(discord.ui.View):
     def __init__(self, entry: dict):
-        super().__init__(timeout=VOTE_DURATION)
+        super().__init__(timeout=None)  # بدون timeout فردي، الإغلاق جماعي بعد 48 ساعة
         self.entry = entry
         self.votes = defaultdict(int)
         self.voted = set()
+        self.message = None
 
         for i in range(1, 6):
             btn = discord.ui.Button(
                 label="⭐" * i,
                 style=discord.ButtonStyle.secondary,
-                custom_id=f"vote_{i}"
+                custom_id=f"vote_{entry['owner_id']}_{i}"
             )
             btn.callback = self.make_callback(i)
             self.add_item(btn)
 
     def make_callback(self, stars: int):
         async def callback(interaction: discord.Interaction):
+            if not competition["active"]:
+                await interaction.response.send_message(
+                    "❌ انتهت المسابقة، لا يمكن التصويت.", ephemeral=True
+                )
+                return
+
             uid = interaction.user.id
             if uid in self.voted:
                 await interaction.response.send_message(
@@ -64,10 +70,8 @@ class VoteView(discord.ui.View):
 
         return callback
 
-    async def on_timeout(self):
-        for item in self.children:
-            item.disabled = True
-
+    def finalize(self):
+        """يُستدعى عند انتهاء المسابقة لحساب النقاط النهائية"""
         total = sum(s * c for s, c in self.votes.items())
         count = sum(self.votes.values())
 
@@ -75,23 +79,15 @@ class VoteView(discord.ui.View):
         competition["scores"][oid] = competition["scores"].get(oid, 0) + total
         competition["owner_names"][oid] = self.entry["owner_name"]
 
-        embed = build_vote_embed(self.entry, total, count, finished=True)
-        if competition["voting_message"]:
-            try:
-                await competition["voting_message"].edit(embed=embed, view=self)
-            except:
-                pass
+        for item in self.children:
+            item.disabled = True
 
-        await next_entry()
+        return total, count
 
 
 def build_vote_embed(entry, total=0, count=0, finished=False):
-    idx = competition["current_index"] + 1
-    total_entries = len(competition["entries"])
-
     embed = discord.Embed(
         title="🎨 مسابقة الرسم — صوّت الآن!",
-        description=f"الصورة **{idx}** من **{total_entries}**",
         color=discord.Color.green() if finished else discord.Color.gold()
     )
     embed.add_field(name="الرسام", value=f"<@{entry['owner_id']}>", inline=False)
@@ -109,58 +105,49 @@ def build_vote_embed(entry, total=0, count=0, finished=False):
             value=f"**{total}** من **{count}** مصوّت",
             inline=False
         )
-        embed.set_footer(text=f"⏳ {VOTE_DURATION} ثانية للتصويت")
+        embed.set_footer(text="⏳ التصويت مفتوح لمدة 48 ساعة")
 
     return embed
 
 
-async def next_entry():
-    competition["current_index"] += 1
-    idx = competition["current_index"]
-
-    if idx >= len(competition["entries"]):
-        await end_competition()
-        return
-
-    channel = bot.get_channel(competition["channel_id"])
-    entry = competition["entries"][idx]
-
-    embed = build_vote_embed(entry)
-    view = VoteView(entry)
-    msg = await channel.send(f"🎨 <@{entry['owner_id']}>", embed=embed, view=view)
-    competition["voting_message"] = msg
-
-
 async def end_competition():
     channel = bot.get_channel(competition["channel_id"])
+
+    # إغلاق كل أزرار التصويت وحساب النقاط النهائية
+    for view in competition["vote_views"]:
+        total, count = view.finalize()
+        embed = build_vote_embed(view.entry, total, count, finished=True)
+        if view.message:
+            try:
+                await view.message.edit(embed=embed, view=view)
+            except:
+                pass
+
     scores = competition["scores"]
-    names = competition["owner_names"]
 
     if not scores:
         await channel.send("❌ لا توجد نتائج.")
-        competition["active"] = False
-        return
+    else:
+        sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        medals = ["🥇", "🥈", "🥉"]
+        lines = []
+        for i, (uid, pts) in enumerate(sorted_scores):
+            medal = medals[i] if i < 3 else f"**#{i+1}**"
+            lines.append(f"{medal} <@{uid}> — **{pts} ⭐**")
 
-    sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    medals = ["🥇", "🥈", "🥉"]
-    lines = []
-    for i, (uid, pts) in enumerate(sorted_scores):
-        medal = medals[i] if i < 3 else f"**#{i+1}**"
-        lines.append(f"{medal} <@{uid}> — **{pts} ⭐**")
-
-    embed = discord.Embed(
-        title="🏆 النتائج النهائية",
-        description="\n".join(lines),
-        color=discord.Color.gold()
-    )
-    embed.set_footer(text="شكراً لجميع المشاركين! 🎨")
-    await channel.send(embed=embed)
+        embed = discord.Embed(
+            title="🏆 النتائج النهائية",
+            description="\n".join(lines),
+            color=discord.Color.gold()
+        )
+        embed.set_footer(text="شكراً لجميع المشاركين! 🎨")
+        await channel.send(embed=embed)
 
     competition["active"] = False
     competition["entries"] = []
     competition["scores"] = {}
     competition["owner_names"] = {}
-    competition["current_index"] = -1
+    competition["vote_views"] = []
 
 
 # ───── الأوامر ─────
@@ -174,7 +161,7 @@ async def start_comp(ctx):
     competition["entries"] = []
     competition["scores"] = {}
     competition["owner_names"] = {}
-    competition["current_index"] = -1
+    competition["vote_views"] = []
     competition["channel_id"] = ctx.channel.id
     await ctx.send(
         "✅ **جاهز لاستقبال الصور!**\n"
@@ -226,14 +213,29 @@ async def begin(ctx):
         return
 
     competition["active"] = True
+
     await ctx.send(
         f"🎉 **انطلقت المسابقة!**\n"
         f"عدد الصور: **{len(competition['entries'])}**\n"
-        f"وقت التصويت لكل صورة: **{VOTE_DURATION} ثانية**\n"
+        f"⏳ التصويت مفتوح لمدة **48 ساعة**\n"
         f"استعدوا! 🎨"
     )
-    await asyncio.sleep(3)
-    await next_entry()
+    await asyncio.sleep(2)
+
+    # إرسال كل الصور دفعة واحدة
+    for entry in competition["entries"]:
+        embed = build_vote_embed(entry)
+        view = VoteView(entry)
+        msg = await ctx.send(f"🎨 <@{entry['owner_id']}>", embed=embed, view=view)
+        view.message = msg
+        competition["vote_views"].append(view)
+        await asyncio.sleep(1)  # تجنب الـ rate limit
+
+    # انتظار 48 ساعة ثم إعلان النتائج
+    await asyncio.sleep(EVENT_DURATION)
+
+    if competition["active"]:
+        await end_competition()
 
 
 @bot.command(name="الغ")
@@ -242,8 +244,19 @@ async def cancel_comp(ctx):
     competition["active"] = False
     competition["entries"] = []
     competition["scores"] = {}
-    competition["current_index"] = -1
+    competition["owner_names"] = {}
+    competition["vote_views"] = []
     await ctx.send("🛑 تم إلغاء المسابقة.")
+
+
+@bot.command(name="انهي")
+@commands.has_permissions(manage_messages=True)
+async def force_end(ctx):
+    if not competition["active"]:
+        await ctx.send("❌ لا توجد مسابقة نشطة.")
+        return
+    await ctx.send("⏹️ تم إنهاء المسابقة يدوياً، جاري حساب النتائج...")
+    await end_competition()
 
 
 @bot.event
